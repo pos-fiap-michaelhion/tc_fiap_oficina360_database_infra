@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Terraform action"
+        description: Terraform action
         required: true
         type: choice
         options:
@@ -15,90 +15,104 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: oficina360-database-terraform
+  cancel-in-progress: false
+
 env:
   AWS_REGION: us-east-1
-  TF_IN_AUTOMATION: true
-  TF_INPUT: false
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
 
-defaults:
-  run:
-    working-directory: infra
+  # Backend conhecido da conta atual.
+  TF_STATE_BUCKET: oficina360-tfstate-337958928021-us-east-1
+  TF_STATE_KEY: oficina360/database/lab.tfstate
+
+  # Entradas Terraform vindas das Variables do GitHub.
+  TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+  TF_VAR_database_access_security_group_id: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
 
 jobs:
   terraform:
     name: Terraform ${{ inputs.action }}
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        working-directory: infra
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - name: Validate AWS identity
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
 
-      - name: Terraform Init
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+
+          if [[ "$ACCOUNT_ID" != "337958928021" ]]; then
+            echo "::error::As credenciais do workflow pertencem a conta $ACCOUNT_ID, mas o backend pertence a conta 337958928021."
+            exit 1
+          fi
+
+          echo "AWS account: $ACCOUNT_ID"
+          echo "AWS caller: $CALLER_ARN"
+
+      - name: Configure Terraform network variables
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
         env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-          TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'oficina360/database/lab.tfstate' }}
-        run: |
-          set -euo pipefail
-
-          : "${TF_STATE_BUCKET:?Repository Variable TF_STATE_BUCKET nao definida}"
-          : "${TF_STATE_KEY:?Repository Variable TF_STATE_KEY nao definida}"
-
-          echo "Backend bucket: $TF_STATE_BUCKET"
-          echo "Backend key: $TF_STATE_KEY"
-
-          aws s3api head-bucket \
-            --bucket "$TF_STATE_BUCKET"
-
-          terraform init -reconfigure \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
-            -backend-config="key=$TF_STATE_KEY" \
-            -backend-config="region=$AWS_REGION" \
-            -backend-config="use_lockfile=true"
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Validate
-        if: inputs.action == 'validate'
-        run: terraform validate
-
-      - name: Configurar variaveis legadas do Terraform
-        env:
           VPC_ID: ${{ vars.VPC_ID }}
-          SUBNET_A_ID_CONFIGURED: ${{ vars.SUBNET_A_ID }}
-          SUBNET_IDS_CONFIGURED: ${{ vars.SUBNET_IDS || vars.LAMBDA_SUBNET_IDS }}
-          DEFAULT_SECURITY_GROUP_ID_CONFIGURED: ${{ vars.DEFAULT_SECURITY_GROUP_ID }}
+          SUBNET_IDS: ${{ vars.SUBNET_IDS || vars.LAMBDA_SUBNET_IDS }}
+          SUBNET_A_ID: ${{ vars.SUBNET_A_ID }}
+          DEFAULT_SECURITY_GROUP_ID: ${{ vars.DEFAULT_SECURITY_GROUP_ID }}
+          DATABASE_ACCESS_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
         run: |
           set -euo pipefail
 
-          : "${VPC_ID:?Organization Variable VPC_ID nao definida}"
+          : "${VPC_ID:?Variable VPC_ID nao definida}"
+          : "${SUBNET_IDS:?Variable SUBNET_IDS ou LAMBDA_SUBNET_IDS nao definida}"
+          : "${DATABASE_ACCESS_SECURITY_GROUP_ID:?Variable LAMBDA_SECURITY_GROUP_ID nao definida}"
 
-          SUBNET_A_ID="$SUBNET_A_ID_CONFIGURED"
+          if [[ ! "$VPC_ID" =~ ^vpc-[0-9a-f]+$ ]]; then
+            echo "::error::VPC_ID possui formato invalido."
+            exit 1
+          fi
+
+          if [[ ! "$SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)+$ ]]; then
+            echo "::error::SUBNET_IDS deve conter pelo menos duas subnets separadas por virgula."
+            exit 1
+          fi
+
+          if [[ ! "$DATABASE_ACCESS_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
+            echo "::error::LAMBDA_SECURITY_GROUP_ID possui formato invalido."
+            exit 1
+          fi
 
           if [[ -z "$SUBNET_A_ID" ]]; then
-            : "${SUBNET_IDS_CONFIGURED:?SUBNET_A_ID e SUBNET_IDS/LAMBDA_SUBNET_IDS nao definidas}"
-            IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS_CONFIGURED"
+            IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
             SUBNET_A_ID="${SUBNET_ARRAY[0]:-}"
           fi
 
           if [[ ! "$SUBNET_A_ID" =~ ^subnet-[0-9a-f]+$ ]]; then
-            echo "::error::subnet_a_id invalida: $SUBNET_A_ID"
+            echo "::error::SUBNET_A_ID possui formato invalido."
             exit 1
           fi
-
-          DEFAULT_SECURITY_GROUP_ID="$DEFAULT_SECURITY_GROUP_ID_CONFIGURED"
 
           if [[ -z "$DEFAULT_SECURITY_GROUP_ID" ]]; then
             DEFAULT_SECURITY_GROUP_ID="$(
@@ -112,92 +126,83 @@ jobs:
           fi
 
           if [[ ! "$DEFAULT_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
-            echo "::error::default_security_group_id invalido: $DEFAULT_SECURITY_GROUP_ID"
-            exit 1
-          fi
-
-          SUBNET_VPC_ID="$(
-            aws ec2 describe-subnets \
-              --subnet-ids "$SUBNET_A_ID" \
-              --query 'Subnets[0].VpcId' \
-              --output text
-          )"
-
-          SG_VPC_ID="$(
-            aws ec2 describe-security-groups \
-              --group-ids "$DEFAULT_SECURITY_GROUP_ID" \
-              --query 'SecurityGroups[0].VpcId' \
-              --output text
-          )"
-
-          if [[ "$SUBNET_VPC_ID" != "$VPC_ID" ]]; then
-            echo "::error::SUBNET_A_ID pertence a $SUBNET_VPC_ID, mas VPC_ID=$VPC_ID"
-            exit 1
-          fi
-
-          if [[ "$SG_VPC_ID" != "$VPC_ID" ]]; then
-            echo "::error::DEFAULT_SECURITY_GROUP_ID pertence a $SG_VPC_ID, mas VPC_ID=$VPC_ID"
-            exit 1
-          fi
-
-          echo "TF_VAR_subnet_a_id=$SUBNET_A_ID" >> "$GITHUB_ENV"
-          echo "TF_VAR_default_security_group_id=$DEFAULT_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
-
-          echo "subnet_a_id configurada: $SUBNET_A_ID"
-          echo "default_security_group_id configurado: $DEFAULT_SECURITY_GROUP_ID"
-
-      - name: Terraform Plan
-        if: inputs.action == 'validate'
-        run: terraform plan
-
-      - name: Configurar rede do Terraform
-        env:
-          VPC_ID: ${{ vars.VPC_ID }}
-          SUBNET_IDS: ${{ vars.LAMBDA_SUBNET_IDS }}
-          DATABASE_ACCESS_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
-        run: |
-          set -euo pipefail
-
-          : "${VPC_ID:?Organization Variable VPC_ID nao definida}"
-          : "${SUBNET_IDS:?Organization Variable LAMBDA_SUBNET_IDS nao definida}"
-          : "${DATABASE_ACCESS_SECURITY_GROUP_ID:?Organization Variable LAMBDA_SECURITY_GROUP_ID nao definida}"
-
-          if [[ ! "$VPC_ID" =~ ^vpc-[0-9a-f]+$ ]]; then
-            echo "::error::VPC_ID possui formato invalido."
-            exit 1
-          fi
-
-          if [[ ! "$SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)+$ ]]; then
-            echo "::error::LAMBDA_SUBNET_IDS deve conter pelo menos duas subnets."
-            exit 1
-          fi
-
-          if [[ ! "$DATABASE_ACCESS_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
-            echo "::error::LAMBDA_SECURITY_GROUP_ID possui formato invalido."
+            echo "::error::DEFAULT_SECURITY_GROUP_ID possui formato invalido."
             exit 1
           fi
 
           SUBNET_IDS_JSON="$(
-            jq -Rc \
-              'split(",") | map(select(length > 0))' \
-              <<< "$SUBNET_IDS"
+            jq -Rc 'split(",") | map(select(length > 0))' <<< "$SUBNET_IDS"
           )"
 
           echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
           echo "TF_VAR_subnet_ids=$SUBNET_IDS_JSON" >> "$GITHUB_ENV"
+          echo "TF_VAR_subnet_a_id=$SUBNET_A_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_default_security_group_id=$DEFAULT_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
 
-          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" \
-            >> "$GITHUB_ENV"
-
-          echo "Rede do RDS configurada."
           echo "VPC: $VPC_ID"
           echo "Subnets: $SUBNET_IDS"
-          echo "Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
+          echo "Subnet A: $SUBNET_A_ID"
+          echo "Default Security Group: $DEFAULT_SECURITY_GROUP_ID"
+          echo "Database access Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
+
+      - name: Validate backend access
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          echo "Backend bucket: $TF_STATE_BUCKET"
+          echo "Backend key: $TF_STATE_KEY"
+
+          aws s3api head-bucket --bucket "$TF_STATE_BUCKET"
+
+          aws s3api list-objects-v2 \
+            --bucket "$TF_STATE_BUCKET" \
+            --prefix "oficina360/database/" \
+            --max-items 5 \
+            --query 'Contents[].Key' \
+            --output text
+
+      - name: Terraform Init
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          terraform init \
+            -reconfigure \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Init without backend
+        if: inputs.action == 'validate'
+        run: |
+          set -euo pipefail
+          terraform init -backend=false -input=false
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        if: inputs.action == 'deploy'
+        run: terraform plan -no-color -out=tfplan
 
       - name: Terraform Apply
         if: inputs.action == 'deploy'
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Outputs
+        if: inputs.action == 'deploy'
+        run: terraform output -json
+
+      - name: Terraform Destroy Plan
+        if: inputs.action == 'destroy'
+        run: terraform plan -destroy -no-color -out=tfdestroy
 
       - name: Terraform Destroy
         if: inputs.action == 'destroy'
-        run: terraform destroy -auto-approve
+        run: terraform apply -auto-approve tfdestroy
