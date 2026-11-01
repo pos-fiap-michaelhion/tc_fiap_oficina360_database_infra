@@ -56,14 +56,11 @@ jobs:
 
       - name: Resolve AWS identity and Terraform backend securely
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        working-directory: .
         run: |
           set -euo pipefail
 
-          IDENTITY_JSON="$(
-            aws sts get-caller-identity \
-              --output json
-          )"
-
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
           ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
           CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
           USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
@@ -81,65 +78,31 @@ jobs:
 
           echo "::add-mask::$TF_STATE_BUCKET"
           echo "::add-mask::$TF_STATE_KEY"
-
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
 
           echo "Identidade AWS validada."
           echo "Backend Terraform resolvido para a sessao atual."
 
-      - name: Configure Terraform network variables
+      - name: Resolve current database network
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        working-directory: .
         env:
-          VPC_ID: ${{ vars.VPC_ID }}
-          SUBNET_IDS: ${{ vars.SUBNET_IDS || vars.LAMBDA_SUBNET_IDS }}
-          DATABASE_ACCESS_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          PROJECT_NAME: oficina360
+          ENVIRONMENT: lab
         run: |
           set -euo pipefail
 
-          : "${VPC_ID:?Variable VPC_ID nao definida}"
-          : "${SUBNET_IDS:?Variable SUBNET_IDS ou LAMBDA_SUBNET_IDS nao definida}"
-          : "${DATABASE_ACCESS_SECURITY_GROUP_ID:?Variable LAMBDA_SECURITY_GROUP_ID nao definida}"
-
-          if [[ ! "$VPC_ID" =~ ^vpc-[0-9a-f]+$ ]]; then
-            echo "::error::VPC_ID possui formato invalido."
+          test -f scripts/resolve-database-network.sh || {
+            echo "::error::Script scripts/resolve-database-network.sh nao encontrado."
             exit 1
-          fi
+          }
 
-          if [[ ! "$SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)+$ ]]; then
-            echo "::error::SUBNET_IDS deve conter pelo menos duas subnets separadas por virgula."
-            exit 1
-          fi
-
-          if [[ ! "$DATABASE_ACCESS_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
-            echo "::error::LAMBDA_SECURITY_GROUP_ID possui formato invalido."
-            exit 1
-          fi
-
-          echo "::add-mask::$VPC_ID"
-          echo "::add-mask::$DATABASE_ACCESS_SECURITY_GROUP_ID"
-
-          IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
-
-          for subnet_id in "${SUBNET_ARRAY[@]}"; do
-            echo "::add-mask::$subnet_id"
-          done
-
-          SUBNET_IDS_JSON="$(
-            jq -Rc \
-              'split(",") | map(select(length > 0))' \
-              <<< "$SUBNET_IDS"
-          )"
-
-          echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
-          echo "TF_VAR_subnet_ids=$SUBNET_IDS_JSON" >> "$GITHUB_ENV"
-          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" \
-            >> "$GITHUB_ENV"
-
-          echo "Rede do RDS validada e configurada."
-          echo "Quantidade de subnets: ${#SUBNET_ARRAY[@]}"
+          bash scripts/resolve-database-network.sh
 
       - name: Validate backend access
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        working-directory: .
         run: |
           set -euo pipefail
 
@@ -149,9 +112,7 @@ jobs:
           echo "::add-mask::$TF_STATE_BUCKET"
           echo "::add-mask::$TF_STATE_KEY"
 
-          aws s3api head-bucket \
-            --bucket "$TF_STATE_BUCKET"
-
+          aws s3api head-bucket --bucket "$TF_STATE_BUCKET"
           echo "Backend S3 acessivel."
 
       - name: Terraform Init
@@ -161,6 +122,7 @@ jobs:
 
           terraform init \
             -reconfigure \
+            -input=false \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=$TF_STATE_KEY" \
             -backend-config="region=$AWS_REGION" \
@@ -190,42 +152,16 @@ jobs:
             > /tmp/terraform-plan.txt 2>&1; then
 
             echo "::error::Falha ao gerar o plano Terraform."
-
-            grep -E \
-              '^(Error:|Warning:)|^[[:space:]]*Error:' \
+            grep -E '^(Error:|Warning:)|^[[:space:]]*Error:' \
               /tmp/terraform-plan.txt || true
-
             exit 1
           fi
 
-          terraform show \
-            -json \
-            tfplan \
-            > /tmp/terraform-plan.json
+          terraform show -json tfplan > /tmp/terraform-plan.json
 
-          CREATE_COUNT="$(
-            jq '[
-              .resource_changes[]?
-              | select(.change.actions | index("create"))
-            ] | length' \
-              /tmp/terraform-plan.json
-          )"
-
-          UPDATE_COUNT="$(
-            jq '[
-              .resource_changes[]?
-              | select(.change.actions == ["update"])
-            ] | length' \
-              /tmp/terraform-plan.json
-          )"
-
-          DELETE_COUNT="$(
-            jq '[
-              .resource_changes[]?
-              | select(.change.actions | index("delete"))
-            ] | length' \
-              /tmp/terraform-plan.json
-          )"
+          CREATE_COUNT="$(jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' /tmp/terraform-plan.json)"
+          UPDATE_COUNT="$(jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' /tmp/terraform-plan.json)"
+          DELETE_COUNT="$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' /tmp/terraform-plan.json)"
 
           echo "Plano Terraform gerado."
           echo "Criacoes ou substituicoes: $CREATE_COUNT"
@@ -271,26 +207,14 @@ jobs:
             > /tmp/terraform-destroy-plan.txt 2>&1; then
 
             echo "::error::Falha ao gerar o plano de destroy."
-
-            grep -E \
-              '^(Error:|Warning:)|^[[:space:]]*Error:' \
+            grep -E '^(Error:|Warning:)|^[[:space:]]*Error:' \
               /tmp/terraform-destroy-plan.txt || true
-
             exit 1
           fi
 
-          terraform show \
-            -json \
-            tfdestroy \
-            > /tmp/terraform-destroy-plan.json
+          terraform show -json tfdestroy > /tmp/terraform-destroy-plan.json
 
-          DELETE_COUNT="$(
-            jq '[
-              .resource_changes[]?
-              | select(.change.actions | index("delete"))
-            ] | length' \
-              /tmp/terraform-destroy-plan.json
-          )"
+          DELETE_COUNT="$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' /tmp/terraform-destroy-plan.json)"
 
           if (( DELETE_COUNT == 0 )); then
             echo "::warning::Nenhum recurso sera removido."
