@@ -74,6 +74,78 @@ jobs:
         if: inputs.action == 'validate'
         run: terraform validate
 
+      - name: Configurar variaveis legadas do Terraform
+        env:
+          VPC_ID: ${{ vars.VPC_ID }}
+          SUBNET_A_ID_CONFIGURED: ${{ vars.SUBNET_A_ID }}
+          SUBNET_IDS_CONFIGURED: ${{ vars.SUBNET_IDS || vars.LAMBDA_SUBNET_IDS }}
+          DEFAULT_SECURITY_GROUP_ID_CONFIGURED: ${{ vars.DEFAULT_SECURITY_GROUP_ID }}
+        run: |
+          set -euo pipefail
+
+          : "${VPC_ID:?Organization Variable VPC_ID nao definida}"
+
+          SUBNET_A_ID="$SUBNET_A_ID_CONFIGURED"
+
+          if [[ -z "$SUBNET_A_ID" ]]; then
+            : "${SUBNET_IDS_CONFIGURED:?SUBNET_A_ID e SUBNET_IDS/LAMBDA_SUBNET_IDS nao definidas}"
+            IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS_CONFIGURED"
+            SUBNET_A_ID="${SUBNET_ARRAY[0]:-}"
+          fi
+
+          if [[ ! "$SUBNET_A_ID" =~ ^subnet-[0-9a-f]+$ ]]; then
+            echo "::error::subnet_a_id invalida: $SUBNET_A_ID"
+            exit 1
+          fi
+
+          DEFAULT_SECURITY_GROUP_ID="$DEFAULT_SECURITY_GROUP_ID_CONFIGURED"
+
+          if [[ -z "$DEFAULT_SECURITY_GROUP_ID" ]]; then
+            DEFAULT_SECURITY_GROUP_ID="$(
+              aws ec2 describe-security-groups \
+                --filters \
+                  "Name=vpc-id,Values=$VPC_ID" \
+                  "Name=group-name,Values=default" \
+                --query 'SecurityGroups[0].GroupId' \
+                --output text
+            )"
+          fi
+
+          if [[ ! "$DEFAULT_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
+            echo "::error::default_security_group_id invalido: $DEFAULT_SECURITY_GROUP_ID"
+            exit 1
+          fi
+
+          SUBNET_VPC_ID="$(
+            aws ec2 describe-subnets \
+              --subnet-ids "$SUBNET_A_ID" \
+              --query 'Subnets[0].VpcId' \
+              --output text
+          )"
+
+          SG_VPC_ID="$(
+            aws ec2 describe-security-groups \
+              --group-ids "$DEFAULT_SECURITY_GROUP_ID" \
+              --query 'SecurityGroups[0].VpcId' \
+              --output text
+          )"
+
+          if [[ "$SUBNET_VPC_ID" != "$VPC_ID" ]]; then
+            echo "::error::SUBNET_A_ID pertence a $SUBNET_VPC_ID, mas VPC_ID=$VPC_ID"
+            exit 1
+          fi
+
+          if [[ "$SG_VPC_ID" != "$VPC_ID" ]]; then
+            echo "::error::DEFAULT_SECURITY_GROUP_ID pertence a $SG_VPC_ID, mas VPC_ID=$VPC_ID"
+            exit 1
+          fi
+
+          echo "TF_VAR_subnet_a_id=$SUBNET_A_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_default_security_group_id=$DEFAULT_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
+
+          echo "subnet_a_id configurada: $SUBNET_A_ID"
+          echo "default_security_group_id configurado: $DEFAULT_SECURITY_GROUP_ID"
+
       - name: Terraform Plan
         if: inputs.action == 'validate'
         run: terraform plan
