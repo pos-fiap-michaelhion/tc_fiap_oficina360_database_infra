@@ -13,13 +13,11 @@ variable "environment" {
 variable "vpc_id" {
   description = "Existing VPC ID"
   type        = string
-  default     = "vpc-0c20197f7b454d158"
 }
 
 variable "subnet_a_id" {
   description = "Existing subnet in us-east-1a"
   type        = string
-  default     = "subnet-0ecf080c1e690de55"
 }
 
 variable "subnet_b_id" {
@@ -31,7 +29,6 @@ variable "subnet_b_id" {
 variable "default_security_group_id" {
   description = "Existing default VPC security group"
   type        = string
-  default     = "sg-050fd408bf8d2ae52"
 }
 
 variable "db_name" {
