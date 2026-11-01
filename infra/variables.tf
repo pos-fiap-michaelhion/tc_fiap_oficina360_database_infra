@@ -10,6 +10,23 @@ variable "environment" {
   default     = "lab"
 }
 
+variable "subnet_ids" {
+  description = "IDs das subnets utilizadas pelo RDS"
+  type        = list(string)
+
+  validation {
+    condition = (
+    length(var.subnet_ids) >= 2 &&
+    alltrue([
+      for subnet_id in var.subnet_ids :
+      can(regex("^subnet-[0-9a-f]+$", subnet_id))
+    ])
+    )
+
+    error_message = "subnet_ids deve conter pelo menos duas subnets AWS validas."
+  }
+}
+
 variable "vpc_id" {
   description = "Existing VPC ID"
   type        = string
