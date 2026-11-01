@@ -79,8 +79,6 @@ jobs:
         env:
           VPC_ID: ${{ vars.VPC_ID }}
           SUBNET_IDS: ${{ vars.SUBNET_IDS || vars.LAMBDA_SUBNET_IDS }}
-          SUBNET_A_ID: ${{ vars.SUBNET_A_ID }}
-          DEFAULT_SECURITY_GROUP_ID: ${{ vars.DEFAULT_SECURITY_GROUP_ID }}
           DATABASE_ACCESS_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
         run: |
           set -euo pipefail
@@ -104,47 +102,19 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "$SUBNET_A_ID" ]]; then
-            IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
-            SUBNET_A_ID="${SUBNET_ARRAY[0]:-}"
-          fi
-
-          if [[ ! "$SUBNET_A_ID" =~ ^subnet-[0-9a-f]+$ ]]; then
-            echo "::error::SUBNET_A_ID possui formato invalido."
-            exit 1
-          fi
-
-          if [[ -z "$DEFAULT_SECURITY_GROUP_ID" ]]; then
-            DEFAULT_SECURITY_GROUP_ID="$(
-              aws ec2 describe-security-groups \
-                --filters \
-                  "Name=vpc-id,Values=$VPC_ID" \
-                  "Name=group-name,Values=default" \
-                --query 'SecurityGroups[0].GroupId' \
-                --output text
-            )"
-          fi
-
-          if [[ ! "$DEFAULT_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
-            echo "::error::DEFAULT_SECURITY_GROUP_ID possui formato invalido."
-            exit 1
-          fi
-
           SUBNET_IDS_JSON="$(
-            jq -Rc 'split(",") | map(select(length > 0))' <<< "$SUBNET_IDS"
+            jq -Rc \
+              'split(",") | map(select(length > 0))' \
+              <<< "$SUBNET_IDS"
           )"
-
           echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
           echo "TF_VAR_subnet_ids=$SUBNET_IDS_JSON" >> "$GITHUB_ENV"
-          echo "TF_VAR_subnet_a_id=$SUBNET_A_ID" >> "$GITHUB_ENV"
-          echo "TF_VAR_default_security_group_id=$DEFAULT_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
-          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" >> "$GITHUB_ENV"
-
+          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" \
+            >> "$GITHUB_ENV"
+          echo "Rede do RDS configurada."
           echo "VPC: $VPC_ID"
           echo "Subnets: $SUBNET_IDS"
-          echo "Subnet A: $SUBNET_A_ID"
-          echo "Default Security Group: $DEFAULT_SECURITY_GROUP_ID"
-          echo "Database access Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
+          echo "Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
 
       - name: Validate backend access
         if: inputs.action == 'deploy' || inputs.action == 'destroy'

@@ -10,42 +10,47 @@ variable "environment" {
   default     = "lab"
 }
 
+variable "vpc_id" {
+  description = "Existing VPC ID"
+  type        = string
+
+  validation {
+    condition     = can(regex("^vpc-[0-9a-f]+$", var.vpc_id))
+    error_message = "vpc_id deve possuir formato vpc-xxxxxxxx."
+  }
+}
+
 variable "subnet_ids" {
   description = "IDs das subnets utilizadas pelo RDS"
   type        = list(string)
 
   validation {
     condition = (
-    length(var.subnet_ids) >= 2 &&
-    alltrue([
-      for subnet_id in var.subnet_ids :
-      can(regex("^subnet-[0-9a-f]+$", subnet_id))
-    ])
+      length(var.subnet_ids) >= 2 &&
+      alltrue([
+        for subnet_id in var.subnet_ids :
+        can(regex("^subnet-[0-9a-f]+$", subnet_id))
+      ])
     )
 
     error_message = "subnet_ids deve conter pelo menos duas subnets AWS validas."
   }
 }
 
-variable "vpc_id" {
-  description = "Existing VPC ID"
+variable "database_access_security_group_id" {
+  description = "Security Group associado ao RDS PostgreSQL"
   type        = string
-}
 
-variable "subnet_a_id" {
-  description = "Existing subnet in us-east-1a"
-  type        = string
-}
+  validation {
+    condition = can(
+      regex(
+        "^sg-[0-9a-f]+$",
+        var.database_access_security_group_id
+      )
+    )
 
-variable "subnet_b_id" {
-  description = "Existing subnet in us-east-1b"
-  type        = string
-  default     = "subnet-0d68164f504b7edbc"
-}
-
-variable "default_security_group_id" {
-  description = "Existing default VPC security group"
-  type        = string
+    error_message = "database_access_security_group_id deve possuir formato sg-xxxxxxxx."
+  }
 }
 
 variable "db_name" {
