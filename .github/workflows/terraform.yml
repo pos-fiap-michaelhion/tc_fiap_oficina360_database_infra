@@ -78,6 +78,50 @@ jobs:
         if: inputs.action == 'validate'
         run: terraform plan
 
+      - name: Configurar rede do Terraform
+        env:
+          VPC_ID: ${{ vars.VPC_ID }}
+          SUBNET_IDS: ${{ vars.LAMBDA_SUBNET_IDS }}
+          DATABASE_ACCESS_SECURITY_GROUP_ID: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
+        run: |
+          set -euo pipefail
+
+          : "${VPC_ID:?Organization Variable VPC_ID nao definida}"
+          : "${SUBNET_IDS:?Organization Variable LAMBDA_SUBNET_IDS nao definida}"
+          : "${DATABASE_ACCESS_SECURITY_GROUP_ID:?Organization Variable LAMBDA_SECURITY_GROUP_ID nao definida}"
+
+          if [[ ! "$VPC_ID" =~ ^vpc-[0-9a-f]+$ ]]; then
+            echo "::error::VPC_ID possui formato invalido."
+            exit 1
+          fi
+
+          if [[ ! "$SUBNET_IDS" =~ ^subnet-[0-9a-f]+(,subnet-[0-9a-f]+)+$ ]]; then
+            echo "::error::LAMBDA_SUBNET_IDS deve conter pelo menos duas subnets."
+            exit 1
+          fi
+
+          if [[ ! "$DATABASE_ACCESS_SECURITY_GROUP_ID" =~ ^sg-[0-9a-f]+$ ]]; then
+            echo "::error::LAMBDA_SECURITY_GROUP_ID possui formato invalido."
+            exit 1
+          fi
+
+          SUBNET_IDS_JSON="$(
+            jq -Rc \
+              'split(",") | map(select(length > 0))' \
+              <<< "$SUBNET_IDS"
+          )"
+
+          echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_subnet_ids=$SUBNET_IDS_JSON" >> "$GITHUB_ENV"
+
+          echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" \
+            >> "$GITHUB_ENV"
+
+          echo "Rede do RDS configurada."
+          echo "VPC: $VPC_ID"
+          echo "Subnets: $SUBNET_IDS"
+          echo "Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
+
       - name: Terraform Apply
         if: inputs.action == 'deploy'
         run: terraform apply -auto-approve
