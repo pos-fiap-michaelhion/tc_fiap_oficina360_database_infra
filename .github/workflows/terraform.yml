@@ -20,17 +20,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-
-  # Backend conhecido da conta atual.
-  TF_STATE_BUCKET: oficina360-tfstate-337958928021-us-east-1
   TF_STATE_KEY: oficina360/database/lab.tfstate
-
-  # Entradas Terraform vindas das Variables do GitHub.
-  TF_VAR_vpc_id: ${{ vars.VPC_ID }}
-  TF_VAR_database_access_security_group_id: ${{ vars.LAMBDA_SECURITY_GROUP_ID }}
 
 jobs:
   terraform:
@@ -40,6 +33,7 @@ jobs:
 
     defaults:
       run:
+        shell: bash
         working-directory: infra
 
     steps:
@@ -48,6 +42,8 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
 
       - name: Configure AWS credentials
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
@@ -58,21 +54,38 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate AWS identity
+      - name: Resolve AWS identity and Terraform backend securely
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          IDENTITY_JSON="$(
+            aws sts get-caller-identity \
+              --output json
+          )"
 
-          if [[ "$ACCOUNT_ID" != "337958928021" ]]; then
-            echo "::error::As credenciais do workflow pertencem a conta $ACCOUNT_ID, mas o backend pertence a conta 337958928021."
-            exit 1
-          fi
+          ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
+          CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
+          USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
 
-          echo "AWS account: $ACCOUNT_ID"
-          echo "AWS caller: $CALLER_ARN"
+          : "${ACCOUNT_ID:?AWS Account ID nao identificado}"
+          : "${CALLER_ARN:?AWS Caller ARN nao identificado}"
+          : "${USER_ID:?AWS User ID nao identificado}"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+          echo "::add-mask::${CALLER_ARN##*/}"
+
+          TF_STATE_BUCKET="oficina360-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
+
+          echo "::add-mask::$TF_STATE_BUCKET"
+          echo "::add-mask::$TF_STATE_KEY"
+
+          echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
+
+          echo "Identidade AWS validada."
+          echo "Backend Terraform resolvido para a sessao atual."
 
       - name: Configure Terraform network variables
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
@@ -102,36 +115,44 @@ jobs:
             exit 1
           fi
 
+          echo "::add-mask::$VPC_ID"
+          echo "::add-mask::$DATABASE_ACCESS_SECURITY_GROUP_ID"
+
+          IFS=',' read -r -a SUBNET_ARRAY <<< "$SUBNET_IDS"
+
+          for subnet_id in "${SUBNET_ARRAY[@]}"; do
+            echo "::add-mask::$subnet_id"
+          done
+
           SUBNET_IDS_JSON="$(
             jq -Rc \
               'split(",") | map(select(length > 0))' \
               <<< "$SUBNET_IDS"
           )"
+
           echo "TF_VAR_vpc_id=$VPC_ID" >> "$GITHUB_ENV"
           echo "TF_VAR_subnet_ids=$SUBNET_IDS_JSON" >> "$GITHUB_ENV"
           echo "TF_VAR_database_access_security_group_id=$DATABASE_ACCESS_SECURITY_GROUP_ID" \
             >> "$GITHUB_ENV"
-          echo "Rede do RDS configurada."
-          echo "VPC: $VPC_ID"
-          echo "Subnets: $SUBNET_IDS"
-          echo "Security Group: $DATABASE_ACCESS_SECURITY_GROUP_ID"
+
+          echo "Rede do RDS validada e configurada."
+          echo "Quantidade de subnets: ${#SUBNET_ARRAY[@]}"
 
       - name: Validate backend access
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          echo "Backend bucket: $TF_STATE_BUCKET"
-          echo "Backend key: $TF_STATE_KEY"
+          : "${TF_STATE_BUCKET:?TF_STATE_BUCKET nao resolvido}"
+          : "${TF_STATE_KEY:?TF_STATE_KEY nao definido}"
 
-          aws s3api head-bucket --bucket "$TF_STATE_BUCKET"
+          echo "::add-mask::$TF_STATE_BUCKET"
+          echo "::add-mask::$TF_STATE_KEY"
 
-          aws s3api list-objects-v2 \
-            --bucket "$TF_STATE_BUCKET" \
-            --prefix "oficina360/database/" \
-            --max-items 5 \
-            --query 'Contents[].Key' \
-            --output text
+          aws s3api head-bucket \
+            --bucket "$TF_STATE_BUCKET"
+
+          echo "Backend S3 acessivel."
 
       - name: Terraform Init
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
@@ -159,20 +180,127 @@ jobs:
 
       - name: Terraform Plan
         if: inputs.action == 'deploy'
-        run: terraform plan -no-color -out=tfplan
+        run: |
+          set -euo pipefail
+
+          if ! terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan \
+            > /tmp/terraform-plan.txt 2>&1; then
+
+            echo "::error::Falha ao gerar o plano Terraform."
+
+            grep -E \
+              '^(Error:|Warning:)|^[[:space:]]*Error:' \
+              /tmp/terraform-plan.txt || true
+
+            exit 1
+          fi
+
+          terraform show \
+            -json \
+            tfplan \
+            > /tmp/terraform-plan.json
+
+          CREATE_COUNT="$(
+            jq '[
+              .resource_changes[]?
+              | select(.change.actions | index("create"))
+            ] | length' \
+              /tmp/terraform-plan.json
+          )"
+
+          UPDATE_COUNT="$(
+            jq '[
+              .resource_changes[]?
+              | select(.change.actions == ["update"])
+            ] | length' \
+              /tmp/terraform-plan.json
+          )"
+
+          DELETE_COUNT="$(
+            jq '[
+              .resource_changes[]?
+              | select(.change.actions | index("delete"))
+            ] | length' \
+              /tmp/terraform-plan.json
+          )"
+
+          echo "Plano Terraform gerado."
+          echo "Criacoes ou substituicoes: $CREATE_COUNT"
+          echo "Atualizacoes: $UPDATE_COUNT"
+          echo "Remocoes ou substituicoes: $DELETE_COUNT"
 
       - name: Terraform Apply
         if: inputs.action == 'deploy'
-        run: terraform apply -auto-approve tfplan
+        run: |
+          set -euo pipefail
+          terraform apply -auto-approve tfplan
 
-      - name: Terraform Outputs
+      - name: Deployment summary
         if: inputs.action == 'deploy'
-        run: terraform output -json
+        run: |
+          set -euo pipefail
+
+          RDS_IDENTIFIER="$(terraform output -raw rds_identifier)"
+          echo "::add-mask::$RDS_IDENTIFIER"
+
+          RDS_STATUS="$(
+            aws rds describe-db-instances \
+              --db-instance-identifier "$RDS_IDENTIFIER" \
+              --region "$AWS_REGION" \
+              --query 'DBInstances[0].DBInstanceStatus' \
+              --output text
+          )"
+
+          echo "Infraestrutura do banco aplicada."
+          echo "Status do RDS: $RDS_STATUS"
+          echo "Outputs detalhados foram omitidos dos logs."
 
       - name: Terraform Destroy Plan
         if: inputs.action == 'destroy'
-        run: terraform plan -destroy -no-color -out=tfdestroy
+        run: |
+          set -euo pipefail
+
+          if ! terraform plan \
+            -destroy \
+            -input=false \
+            -no-color \
+            -out=tfdestroy \
+            > /tmp/terraform-destroy-plan.txt 2>&1; then
+
+            echo "::error::Falha ao gerar o plano de destroy."
+
+            grep -E \
+              '^(Error:|Warning:)|^[[:space:]]*Error:' \
+              /tmp/terraform-destroy-plan.txt || true
+
+            exit 1
+          fi
+
+          terraform show \
+            -json \
+            tfdestroy \
+            > /tmp/terraform-destroy-plan.json
+
+          DELETE_COUNT="$(
+            jq '[
+              .resource_changes[]?
+              | select(.change.actions | index("delete"))
+            ] | length' \
+              /tmp/terraform-destroy-plan.json
+          )"
+
+          if (( DELETE_COUNT == 0 )); then
+            echo "::warning::Nenhum recurso sera removido."
+          fi
+
+          echo "Plano de destroy gerado."
+          echo "Recursos com remocao planejada: $DELETE_COUNT"
 
       - name: Terraform Destroy
         if: inputs.action == 'destroy'
-        run: terraform apply -auto-approve tfdestroy
+        run: |
+          set -euo pipefail
+          terraform apply -auto-approve tfdestroy
